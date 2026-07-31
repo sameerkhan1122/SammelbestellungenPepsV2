@@ -62,13 +62,12 @@
   }
 
   // ---------- Preisliste (Excel-Import) ----------
-  // Erwartetes Format: Spalten "Kategorie", "Produkt", "Menge", "Preis"
+  // Erwartetes Format: Spalten "Produkt", "Menge", "Preis"
   // (Groß-/Kleinschreibung und Reihenfolge egal). Wird komplett im Browser
   // mit SheetJS geparst - kein Server-Roundtrip nötig, das Ergebnis landet
   // einfach als normales Feld im Order-Objekt und wird wie alles andere
   // synchronisiert.
   const COLUMN_ALIASES = {
-    category: ["kategorie", "category", "kat"],
     name: ["produkt", "product", "artikel", "name"],
     qty: ["menge", "qty", "quantity", "anzahl"],
     price: ["preis", "price", "kosten", "cost"],
@@ -98,12 +97,11 @@
       sawAnySheet = true;
 
       const headerRow = rows[0];
-      const catIdx = findColumnKey(headerRow, COLUMN_ALIASES.category);
       const nameIdx = findColumnKey(headerRow, COLUMN_ALIASES.name);
       const qtyIdx = findColumnKey(headerRow, COLUMN_ALIASES.qty);
       const priceIdx = findColumnKey(headerRow, COLUMN_ALIASES.price);
 
-      // Produkt- und Preis-Spalte sind Pflicht; Kategorie und Menge optional.
+      // Produkt- und Preis-Spalte sind Pflicht; Menge optional.
       if (nameIdx === -1 || priceIdx === -1) return;
 
       for (let r = 1; r < rows.length; r++) {
@@ -116,10 +114,8 @@
         if (isNaN(priceNum)) continue;
         const qtyRaw = qtyIdx !== -1 ? row[qtyIdx] : "";
         const qtyNum = parseInt(String(qtyRaw ?? "").replace(/[^0-9-]/g, ""), 10);
-        const category = catIdx !== -1 ? String(row[catIdx] ?? "").trim() : "";
 
         items.push({
-          category,
           name,
           qty: !isNaN(qtyNum) && qtyNum > 0 ? qtyNum : null,
           price: Math.round(priceNum * 100) / 100,
@@ -132,7 +128,7 @@
     }
     if (items.length === 0) {
       throw new Error(
-        'Keine gültigen Zeilen gefunden. Erwartet werden Spalten "Kategorie", "Produkt", "Menge" und "Preis" (Kategorie/Menge optional).'
+        'Keine gültigen Zeilen gefunden. Erwartet werden Spalten "Produkt", "Menge" und "Preis" (Menge optional).'
       );
     }
     return items;
@@ -551,9 +547,16 @@
         rm.setAttribute("aria-label", `${p} entfernen`);
         rm.innerHTML = ICONS.x;
         rm.addEventListener("click", () => {
-          removePerson(p);
-          render();
-          persist();
+          showConfirmDialog({
+            title: "Person entfernen?",
+            message: `"${p}" wird aus der Personenliste entfernt und aus allen Produkten in allen Sammelbestellungen ausgetragen. Das kann nicht rückgängig gemacht werden.`,
+            confirmLabel: "Entfernen",
+            onConfirm: () => {
+              removePerson(p);
+              render();
+              persist();
+            },
+          });
         });
         chip.appendChild(rm);
         chipsRow.appendChild(chip);
@@ -673,7 +676,7 @@
     const hint = document.createElement("div");
     hint.className = "pricelist-hint";
     hint.textContent =
-      'Excel-Datei (.xlsx) mit den Spalten "Kategorie", "Produkt", "Menge" und "Preis". Beim Eintragen eines Produkts kann dann aus der Liste ausgewählt werden.';
+      'Excel-Datei (.xlsx) mit den Spalten "Produkt", "Menge" und "Preis". Beim Eintragen eines Produkts kann dann aus der Liste ausgewählt werden.';
     section.appendChild(hint);
 
     return section;
@@ -1068,9 +1071,16 @@
       render();
     });
     delBtn.addEventListener("click", () => {
-      order.products = order.products.filter((p) => p.id !== product.id);
-      render();
-      persist();
+      showConfirmDialog({
+        title: "Produkt löschen?",
+        message: `"${product.name}" wird endgültig aus dieser Sammelbestellung gelöscht. Das kann nicht rückgängig gemacht werden.`,
+        confirmLabel: "Endgültig löschen",
+        onConfirm: () => {
+          order.products = order.products.filter((p) => p.id !== product.id);
+          render();
+          persist();
+        },
+      });
     });
 
     return row;
@@ -1162,7 +1172,7 @@
         row.className = "autocomplete-item" + (idx === autocompleteActiveIndex ? " active" : "");
         row.innerHTML = `
           <span class="autocomplete-item-name">
-            ${item.category ? `<span class="autocomplete-item-category">${esc(item.category)}</span>` : ""}${esc(item.name)}
+            ${esc(item.name)}
           </span>
           <span class="autocomplete-item-meta">${currency(item.price)}</span>
         `;
