@@ -21,6 +21,7 @@
     check: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
     bag: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18M16 10a4 4 0 0 1-8 0"/></svg>',
     users: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px;vertical-align:-3px"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+    list: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:5px;vertical-align:-2px"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M9 13h6M9 17h6"/></svg>',
   };
 
   function uid() {
@@ -31,6 +32,10 @@
     return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
+  function currencyEUR(n) {
+    return "€" + n.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
   function esc(s) {
     const d = document.createElement("div");
     d.textContent = s;
@@ -38,7 +43,7 @@
   }
 
   function makeOrder(title) {
-    return { id: uid(), title, products: [], shipping: "", discount: "", priceList: [], priceListName: "" };
+    return { id: uid(), title, products: [], shipping: "", discount: "", priceList: [], priceListName: "", eurRate: "0.865" };
   }
 
   function defaultState() {
@@ -134,7 +139,7 @@
     return items;
   }
 
-  function handlePriceListFile(order, file) {
+  function handlePriceListFile(order, file, onDone) {
     priceListError = "";
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -146,12 +151,14 @@
       } catch (err) {
         priceListError = String(err.message || err);
       }
-      render();
       persist();
+      if (onDone) onDone();
+      else render();
     };
     reader.onerror = () => {
       priceListError = "Datei konnte nicht gelesen werden.";
-      render();
+      if (onDone) onDone();
+      else render();
     };
     reader.readAsArrayBuffer(file);
   }
@@ -178,6 +185,7 @@
   let peopleManagerOpen = false;
   let newPersonInputValue = "";
   let priceListError = "";
+  let priceListPanelOpen = false;
   let autocompleteOpen = false;
   let autocompleteActiveIndex = -1;
 
@@ -602,73 +610,125 @@
     return section;
   }
 
-  function renderPriceListSection(order) {
-    const section = document.createElement("section");
-    section.className = "section pricelist-section-compact";
+  // Kompakte Preisliste-Verwaltung, eingebettet im Produktformular (statt
+  // einer eigenen großen Sektion oben auf der Seite). Klappt bei Bedarf auf.
+  function renderPriceListInline(order, onChange) {
+    const wrap = document.createElement("div");
+    wrap.className = "pricelist-inline";
 
-    const row = document.createElement("div");
-    row.className = "pricelist-compact-row";
+    const toggleLine = document.createElement("button");
+    toggleLine.type = "button";
+    toggleLine.className = "pricelist-inline-toggle";
+    const label =
+      order.priceList.length > 0
+        ? `${ICONS.list}Preisliste (${order.priceList.length})`
+        : `${ICONS.list}Preisliste hochladen`;
+    toggleLine.innerHTML = label;
+    wrap.appendChild(toggleLine);
 
-    const text = document.createElement("div");
-    text.className = "pricelist-compact-text";
-    if (order.priceList.length > 0) {
-      text.innerHTML = `Preisliste: <strong>${order.priceList.length} Produkte</strong>${
-        order.priceListName ? ` (${esc(order.priceListName)})` : ""
-      }`;
-    } else {
-      text.textContent = "Keine Preisliste hochgeladen";
-    }
-    row.appendChild(text);
+    const panel = document.createElement("div");
+    panel.className = "pricelist-inline-panel";
+    panel.style.display = priceListPanelOpen ? "block" : "none";
 
-    const actions = document.createElement("div");
-    actions.className = "pricelist-compact-actions";
+    function renderPanelContent() {
+      panel.innerHTML = "";
 
-    const fileLabel = document.createElement("label");
-    fileLabel.className = "file-input-label-compact";
-    fileLabel.textContent = order.priceList.length > 0 ? "Ersetzen" : "Preisliste hochladen (.xlsx)";
-    const fileInput = document.createElement("input");
-    fileInput.type = "file";
-    fileInput.accept = ".xlsx,.xls";
-    fileInput.addEventListener("change", (e) => {
-      const file = e.target.files && e.target.files[0];
-      if (file) handlePriceListFile(order, file);
-      e.target.value = "";
-    });
-    fileLabel.appendChild(fileInput);
-    actions.appendChild(fileLabel);
+      const summary = document.createElement("div");
+      summary.className = "pricelist-summary";
+      const text = document.createElement("div");
+      text.className = "pricelist-summary-text";
+      if (order.priceList.length > 0) {
+        text.innerHTML = `<strong>${order.priceList.length} Produkte</strong> geladen${
+          order.priceListName ? ` aus „${esc(order.priceListName)}“` : ""
+        }`;
+      } else {
+        text.textContent = "Noch keine Preisliste hochgeladen.";
+      }
+      summary.appendChild(text);
 
-    if (order.priceList.length > 0) {
-      const clearBtn = document.createElement("button");
-      clearBtn.type = "button";
-      clearBtn.className = "pricelist-compact-remove";
-      clearBtn.textContent = "Entfernen";
-      clearBtn.addEventListener("click", () => {
-        showConfirmDialog({
-          title: "Preisliste entfernen?",
-          message: "Die geladene Preisliste wird entfernt. Bereits hinzugefügte Produkte bleiben erhalten.",
-          confirmLabel: "Entfernen",
-          onConfirm: () => {
-            order.priceList = [];
-            order.priceListName = "";
-            render();
-            persist();
-          },
-        });
+      const actions = document.createElement("div");
+      actions.className = "pricelist-summary-actions";
+      const fileLabel = document.createElement("label");
+      fileLabel.className = "file-input-label";
+      fileLabel.textContent = order.priceList.length > 0 ? "Ersetzen" : "Hochladen";
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.accept = ".xlsx,.xls";
+      fileInput.addEventListener("change", (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (file) {
+          handlePriceListFile(order, file, () => {
+            toggleLine.innerHTML =
+              order.priceList.length > 0
+                ? `${ICONS.list}Preisliste (${order.priceList.length})`
+                : `${ICONS.list}Preisliste hochladen`;
+            renderPanelContent();
+          });
+        }
+        e.target.value = "";
       });
-      actions.appendChild(clearBtn);
+      fileLabel.appendChild(fileInput);
+      actions.appendChild(fileLabel);
+
+      if (order.priceList.length > 0) {
+        const clearBtn = document.createElement("button");
+        clearBtn.type = "button";
+        clearBtn.className = "btn secondary small";
+        clearBtn.textContent = "Entfernen";
+        clearBtn.addEventListener("click", () => {
+          showConfirmDialog({
+            title: "Preisliste entfernen?",
+            message: "Die geladene Preisliste wird entfernt. Bereits hinzugefügte Produkte bleiben erhalten.",
+            confirmLabel: "Entfernen",
+            onConfirm: () => {
+              order.priceList = [];
+              order.priceListName = "";
+              persist();
+              renderPanelContent();
+              toggleLine.innerHTML = `${ICONS.list}Preisliste hochladen`;
+            },
+          });
+        });
+        actions.appendChild(clearBtn);
+      }
+      summary.appendChild(actions);
+      panel.appendChild(summary);
+
+      if (priceListError) {
+        const err = document.createElement("div");
+        err.className = "pricelist-error";
+        err.textContent = priceListError;
+        panel.appendChild(err);
+      }
+
+      const hint = document.createElement("div");
+      hint.className = "pricelist-hint";
+      hint.textContent =
+        'Excel-Datei (.xlsx) mit den Spalten "Produkt", "Menge" und "Preis". Beim Eintragen eines Produkts kann dann aus der Liste ausgewählt werden.';
+      panel.appendChild(hint);
     }
 
-    row.appendChild(actions);
-    section.appendChild(row);
+    renderPanelContent();
 
-    if (priceListError) {
-      const err = document.createElement("div");
-      err.className = "pricelist-error";
-      err.textContent = priceListError;
-      section.appendChild(err);
-    }
+    toggleLine.addEventListener("click", () => {
+      priceListPanelOpen = !priceListPanelOpen;
+      panel.style.display = priceListPanelOpen ? "block" : "none";
+    });
 
-    return section;
+    // Nach einem erfolgreichen/fehlgeschlagenen Upload aktualisiert der
+    // Callback in handlePriceListFile das Panel gezielt (siehe oben) - so
+    // bleibt das restliche, bereits ausgefüllte Formular unangetastet.
+    wrap.appendChild(panel);
+    return {
+      element: wrap,
+      refresh: () => {
+        toggleLine.innerHTML =
+          order.priceList.length > 0
+            ? `${ICONS.list}Preisliste (${order.priceList.length})`
+            : `${ICONS.list}Preisliste hochladen`;
+        renderPanelContent();
+      },
+    };
   }
 
   function renderOrderView(order) {
@@ -678,26 +738,24 @@
     if (order.discountEnabled == null) order.discountEnabled = false;
     if (order.priceList == null) order.priceList = [];
     if (order.priceListName == null) order.priceListName = "";
+    if (order.eurRate == null) order.eurRate = "0.865";
 
     const frag = document.createDocumentFragment();
 
     // ---- Personen verwalten ----
     frag.appendChild(renderPeopleManagerSection());
 
-    // ---- Produkte section (Kernstück der Seite -> visuell hervorgehoben) ----
+    // ---- Produkte section ----
     const productsSection = document.createElement("section");
-    productsSection.className = "section products-section-highlight";
+    productsSection.className = "section";
 
     const productsHead = document.createElement("div");
     productsHead.className = "section-head";
-    productsHead.innerHTML = `<h2 class="products-title">Produkte</h2>`;
-    const hasProducts = order.products.length > 0;
-    if (!formOpen && hasProducts) {
-      // Schon Produkte da -> kompakter Button oben rechts, damit die Liste im
-      // Vordergrund bleibt.
+    productsHead.innerHTML = `<h2>Produkte</h2>`;
+    if (!formOpen) {
       const addBtn = document.createElement("button");
       addBtn.type = "button";
-      addBtn.className = "btn primary small";
+      addBtn.className = "btn primary btn-add-product";
       addBtn.innerHTML = `${ICONS.plus}Produkt hinzufügen`;
       addBtn.addEventListener("click", () => {
         formOpen = true;
@@ -713,25 +771,12 @@
       productsSection.appendChild(renderProductForm(order, editingProduct));
     }
 
-    if (!hasProducts && !formOpen) {
-      // Noch keine Produkte -> großer, gut sichtbarer Einstiegspunkt, damit
-      // sofort klar ist, dass und wie man loslegt.
+    if (order.products.length === 0 && !formOpen) {
       const empty = document.createElement("div");
       empty.className = "empty";
-      empty.textContent = "Noch keine Produkte eingetragen.";
+      empty.textContent = "Noch keine Produkte eingetragen. Tippe oben auf „Produkt hinzufügen“, um loszulegen.";
       productsSection.appendChild(empty);
-
-      const addBtnBig = document.createElement("button");
-      addBtnBig.type = "button";
-      addBtnBig.className = "btn primary large products-cta";
-      addBtnBig.innerHTML = `${ICONS.plus}Produkt hinzufügen`;
-      addBtnBig.addEventListener("click", () => {
-        formOpen = true;
-        editingProductId = null;
-        render();
-      });
-      productsSection.appendChild(addBtnBig);
-    } else if (hasProducts) {
+    } else if (order.products.length > 0) {
       const list = document.createElement("div");
       list.className = "product-list";
       order.products.forEach((p) => list.appendChild(renderProductRow(order, p)));
@@ -883,9 +928,6 @@
       frag.appendChild(renderInvoiceSection(order));
     }
 
-    // ---- Preisliste (Verwaltung, unauffällig am Ende) ----
-    frag.appendChild(renderPriceListSection(order));
-
     return frag;
   }
 
@@ -893,6 +935,7 @@
     const factor = getDiscountFactor(order);
     const discountNum = order.discountEnabled ? (parseFloat(String(order.discount).replace(",", ".")) || 0) : 0;
     const shippingNum = parseFloat(String(order.shipping).replace(",", ".")) || 0;
+    const rate = parseFloat(String(order.eurRate).replace(",", ".")) || 0;
 
     // Gleiche Produkte (gleicher Name + gleicher Preis) zusammenfassen,
     // ohne Bezug auf die Personen, die es bestellt haben.
@@ -911,26 +954,32 @@
     const discountedSubtotal = subtotal * factor;
     const total = discountedSubtotal + shippingNum;
 
-    // WhatsApp rendert *text* fett und _text_ kursiv, wenn eingefügt -
-    // das nutzen wir, damit Bestellung und Summe auf einen Blick klar sind.
+    // Baut zu einer USD-Zeile die passende, optisch untergeordnete
+    // EUR-Zeile darunter (eingerückt, nur wenn ein gültiger Kurs eingetragen ist).
+    const withEur = (usdLine, usd) => {
+      if (rate <= 0) return usdLine;
+      return `${usdLine}\n   ≈ ${currencyEUR(usd * rate)}`;
+    };
+
     const lines = [];
-    lines.push(`*${order.title || "Bestellung"}*`);
-    lines.push("");
+    if (order.title) lines.push(order.title);
+    if (lines.length) lines.push("");
 
     items.forEach((it) => {
-      lines.push(`${it.qty}x ${it.name} — ${currency(it.price * it.qty)}`);
+      const itemTotal = it.price * it.qty;
+      lines.push(withEur(`${it.qty}x ${it.name} - ${currency(itemTotal)}`, itemTotal));
     });
 
     lines.push("");
-    lines.push("_____________");
-    lines.push(`Subtotal: ${currency(subtotal)}`);
+    lines.push(withEur(`Subtotal: ${currency(subtotal)}`, subtotal));
     if (discountNum > 0) {
-      lines.push(`Discount (${discountNum}%): -${currency(subtotal - discountedSubtotal)}`);
+      const discountAmt = subtotal - discountedSubtotal;
+      lines.push(withEur(`Rabatt (${discountNum}%): -${currency(discountAmt)}`, discountAmt));
     }
     if (shippingNum > 0) {
-      lines.push(`Shipping: ${currency(shippingNum)}`);
+      lines.push(withEur(`Versand: ${currency(shippingNum)}`, shippingNum));
     }
-    lines.push(`*Total: ${currency(total)}*`);
+    lines.push(withEur(`Gesamt: ${currency(total)}`, total));
 
     return lines.join("\n");
   }
@@ -953,8 +1002,21 @@
     const hint = document.createElement("div");
     hint.className = "invoice-hint";
     hint.style.margin = "0 0 10px";
-    hint.textContent = "Alle Produkte zusammengerechnet, ohne Namen der Bestellenden. Kann direkt kopiert und z. B. bei WhatsApp an den Verkäufer geschickt werden.";
+    hint.textContent = "Alle Produkte zusammengerechnet, ohne Namen der Bestellenden. Kann direkt kopiert und an den Verkäufer geschickt werden.";
     section.appendChild(hint);
+
+    const rateRow = document.createElement("div");
+    rateRow.className = "invoice-rate-row";
+    const rateLabel = document.createElement("label");
+    rateLabel.className = "invoice-rate-label";
+    rateLabel.textContent = "Wechselkurs (1 USD = ? EUR)";
+    const rateInput = document.createElement("input");
+    rateInput.className = "text-input invoice-rate-input";
+    rateInput.inputMode = "decimal";
+    rateInput.value = order.eurRate;
+    rateRow.appendChild(rateLabel);
+    rateRow.appendChild(rateInput);
+    section.appendChild(rateRow);
 
     const textarea = document.createElement("textarea");
     textarea.className = "invoice-textarea";
@@ -963,6 +1025,18 @@
     textarea.value = buildInvoiceText(order);
     textarea.rows = Math.min(20, Math.max(6, textarea.value.split("\n").length + 1));
     section.appendChild(textarea);
+
+    rateInput.addEventListener("input", (e) => {
+      const v = e.target.value;
+      if (/^[0-9]*[.,]?[0-9]{0,4}$/.test(v)) {
+        order.eurRate = v;
+        persist();
+        textarea.value = buildInvoiceText(order);
+        textarea.rows = Math.min(20, Math.max(6, textarea.value.split("\n").length + 1));
+      } else {
+        e.target.value = order.eurRate;
+      }
+    });
 
     copyBtn.addEventListener("click", async () => {
       try {
@@ -1248,6 +1322,9 @@
     nameErr.textContent = "Bitte einen Produktnamen eingeben.";
     nameField.appendChild(nameErr);
     card.appendChild(nameField);
+
+    const priceListWidget = renderPriceListInline(order);
+    card.appendChild(priceListWidget.element);
 
     function applyAutocompleteItem(item) {
       name = item.name;
