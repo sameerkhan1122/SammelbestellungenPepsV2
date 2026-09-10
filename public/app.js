@@ -43,6 +43,7 @@
     users: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px;vertical-align:-3px"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
     chevron: '<svg class="chevron-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>',
     mapPin: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>',
+    lock: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
   };
 
   function uid() {
@@ -90,6 +91,95 @@
     return d.innerHTML;
   }
 
+  // ---------- Adressschutz (clientseitige Verschlüsselung) ----------
+  // Adressen einer Sammelbestellung können mit einem Passwort geschützt
+  // werden. Die Verschlüsselung passiert komplett im Browser (Web Crypto
+  // API, AES-GCM mit einem aus dem Passwort abgeleiteten Schlüssel via
+  // PBKDF2) - der Server sieht nur den bereits verschlüsselten Blob, nie
+  // das Passwort oder die Klardaten. Ohne das richtige Passwort lässt sich
+  // der Blob nicht entschlüsseln.
+  const RECOVERY_CODE = "neuesPasswortAG3XPG2Q";
+  const PBKDF2_ITERATIONS = 150000;
+
+  function randomBytes(len) {
+    const arr = new Uint8Array(len);
+    crypto.getRandomValues(arr);
+    return arr;
+  }
+
+  function bytesToBase64(bytes) {
+    let bin = "";
+    bytes.forEach((b) => (bin += String.fromCharCode(b)));
+    return btoa(bin);
+  }
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  async function deriveKey(password, saltB64) {
+    const salt = base64ToBytes(saltB64);
+    const enc = new TextEncoder();
+    const baseKey = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+      baseKey,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  }
+
+  async function encryptJSON(data, key) {
+    const iv = randomBytes(12);
+    const enc = new TextEncoder();
+    const plaintext = enc.encode(JSON.stringify(data));
+    const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+    return { iv: bytesToBase64(iv), data: bytesToBase64(new Uint8Array(cipherBuf)) };
+  }
+
+  // Gibt bei falschem Passwort null zurück (AES-GCM erkennt Manipulation/
+  // falschen Schlüssel zuverlässig über den eingebauten Auth-Tag), statt
+  // eine Exception nach außen dringen zu lassen.
+  async function decryptJSON(blob, key) {
+    try {
+      const iv = base64ToBytes(blob.iv);
+      const cipherBytes = base64ToBytes(blob.data);
+      const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipherBytes);
+      const dec = new TextDecoder();
+      return JSON.parse(dec.decode(plainBuf));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Setzt (oder ersetzt) das Adressschutz-Passwort einer Order. Verschlüsselt
+  // dabei die aktuell für diese Order relevanten Adressen (aller Beteiligten
+  // über alle Produkte) mit dem neuen Passwort. Ein vorheriges Passwort wird
+  // dabei ungültig - siehe Nutzerhinweis beim Zurücksetzen in der UI.
+  async function setOrderAddressPassword(order, password, addressesToEncrypt) {
+    const salt = bytesToBase64(randomBytes(16));
+    const key = await deriveKey(password, salt);
+    const verifier = await encryptJSON({ ok: true }, key);
+    const encryptedAddresses = await encryptJSON(addressesToEncrypt, key);
+    order.addressProtection = { salt, verifier, encryptedAddresses };
+  }
+
+  // Prüft ein eingegebenes Passwort gegen die Order und gibt bei Erfolg die
+  // entschlüsselten Adressen zurück, sonst null. Nichts wird gespeichert -
+  // das Passwort existiert nur für den Moment der Prüfung im Speicher.
+  async function tryUnlockOrderAddresses(order, password) {
+    const prot = order.addressProtection;
+    if (!prot) return null;
+    const key = await deriveKey(password, prot.salt);
+    const check = await decryptJSON(prot.verifier, key);
+    if (!check || check.ok !== true) return null;
+    return (await decryptJSON(prot.encryptedAddresses, key)) || {};
+  }
+
   // Prüft, ob zwei Produkteinträge als "dasselbe Produkt für dieselbe Gruppe"
   // gelten: gleicher Produktname (Groß-/Kleinschreibung und Leerzeichen am
   // Rand egal) UND exakt dieselbe Menge an beteiligten Personen (Reihenfolge
@@ -105,7 +195,17 @@
   }
 
   function makeOrder(title) {
-    return { id: uid(), title, products: [], shipping: "", discount: "", priceList: [], priceListName: "", eurRate: "0.865" };
+    return {
+      id: uid(),
+      title,
+      products: [],
+      shipping: "",
+      discount: "",
+      priceList: [],
+      priceListName: "",
+      eurRate: "0.865",
+      addressProtection: null,
+    };
   }
 
   function defaultState() {
@@ -246,6 +346,13 @@
   let peopleManagerOpen = false;
   let newPersonInputValue = "";
   let editingAddressFor = null;
+  // Pro Order-ID: die aktuell entschlüsselten Adressen (nur im Speicher
+  // dieser Sitzung, nie persistiert). Wird beim Neuladen der Seite geleert.
+  const unlockedAddressesByOrder = {};
+  // Zeigt gerade das Passwort-Formular für diese Order-ID an (und in
+  // welchem Modus: "unlock" zum Ansehen, "set" zum Erstellen/Ändern).
+  let addressPasswordUI = null; // { orderId, mode: "unlock" | "set" }
+  let addressPasswordError = "";
   let priceListError = "";
   let autocompleteOpen = false;
   let autocompleteActiveIndex = -1;
@@ -393,6 +500,27 @@
     return !!(a && (a.fullName || a.street || a.zip || a.city || a.country));
   }
 
+  // Alle Personennamen, die an mindestens einem Produkt dieser Order beteiligt
+  // sind (ohne Duplikate).
+  function getOrderParticipants(order) {
+    const set = new Set();
+    order.products.forEach((p) => p.participants.forEach((name) => set.add(name)));
+    return Array.from(set);
+  }
+
+  // Sammelt die aktuellen (Klartext-)Adressen aller Beteiligten dieser Order
+  // aus state.addresses, als einfaches { name: adresse }-Objekt - das ist
+  // die Datenmenge, die beim Setzen/Ändern des Adressschutz-Passworts
+  // verschlüsselt wird.
+  function collectOrderAddresses(order) {
+    const result = {};
+    getOrderParticipants(order).forEach((name) => {
+      const a = getAddress(name);
+      if (a) result[name] = a;
+    });
+    return result;
+  }
+
   // ---------- Bestätigungs-Dialog ----------
   // Generischer "Bist du sicher?"-Dialog für gefährliche Aktionen (z. B.
   // Löschen). Wird an document.body gehängt, damit er ein normales render()
@@ -439,9 +567,245 @@
     document.body.appendChild(overlay);
   }
 
+  // Zeigt den Passwort-Dialog für Adressschutz: je nach mode entweder zum
+  // Entsperren (Ansehen der Adressen) oder zum Setzen/Ändern des Passworts.
+  // Beim Setzen/Ändern muss zuerst der Recovery-Code eingegeben werden, der
+  // dann das eigentliche Passwortfeld freischaltet.
+  function showAddressPasswordDialog(order) {
+    if (!window.crypto || !window.crypto.subtle) {
+      addressPasswordUI = null;
+      alert(
+        "Adressschutz benötigt eine sichere Verbindung (https) und einen aktuellen Browser. Bitte die Seite über https aufrufen."
+      );
+      return;
+    }
+    const { mode } = addressPasswordUI;
+    const isProtected = !!order.addressProtection;
+
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-overlay";
+
+    const box = document.createElement("div");
+    box.className = "confirm-box address-password-box";
+
+    const title = mode === "unlock" ? "Adresse ansehen" : isProtected ? "Passwort ändern" : "Adressschutz einrichten";
+    box.innerHTML = `<div class="confirm-title">${esc(title)}</div>`;
+
+    if (addressPasswordError) {
+      const err = document.createElement("div");
+      err.className = "address-password-error";
+      err.textContent = addressPasswordError;
+      box.appendChild(err);
+    }
+
+    const closeDialog = () => {
+      addressPasswordUI = null;
+      addressPasswordError = "";
+      render();
+    };
+
+    // ---- Modus "unlock": Passwort eingeben, um die Adressen zu sehen ----
+    if (mode === "unlock") {
+      const msg = document.createElement("div");
+      msg.className = "confirm-message";
+      msg.textContent = "Diese Sammelbestellung ist passwortgeschützt. Gib das Passwort ein, um die Adressen zu sehen.";
+      box.appendChild(msg);
+
+      const field = document.createElement("div");
+      field.className = "field";
+      field.innerHTML = `<label class="label">Passwort</label>`;
+      const input = document.createElement("input");
+      input.className = "text-input";
+      input.type = "password";
+      input.autocomplete = "off";
+      field.appendChild(input);
+      box.appendChild(field);
+
+      const forgotBtn = document.createElement("button");
+      forgotBtn.type = "button";
+      forgotBtn.className = "address-password-link";
+      forgotBtn.textContent = "Passwort vergessen?";
+      forgotBtn.addEventListener("click", () => {
+        addressPasswordUI = { orderId: order.id, mode: "set" };
+        addressPasswordError = "";
+        render();
+      });
+      box.appendChild(forgotBtn);
+
+      const actions = document.createElement("div");
+      actions.className = "confirm-actions";
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "btn secondary form-btn";
+      cancelBtn.textContent = "Abbrechen";
+      cancelBtn.addEventListener("click", closeDialog);
+
+      const submitBtn = document.createElement("button");
+      submitBtn.type = "button";
+      submitBtn.className = "btn primary form-btn";
+      submitBtn.textContent = "Entsperren";
+      const submit = async () => {
+        const pw = input.value;
+        if (!pw) return;
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Prüfe…";
+        const result = await tryUnlockOrderAddresses(order, pw);
+        if (result === null) {
+          addressPasswordError = "Falsches Passwort.";
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Entsperren";
+          render();
+          return;
+        }
+        unlockedAddressesByOrder[order.id] = result;
+        addressPasswordUI = null;
+        addressPasswordError = "";
+        render();
+      };
+      submitBtn.addEventListener("click", submit);
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") submit();
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(submitBtn);
+      box.appendChild(actions);
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+      input.focus();
+      overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) closeDialog();
+      });
+      return;
+    }
+
+    // ---- Modus "set": zuerst Recovery-Code, dann neues Passwort ----
+    const msg = document.createElement("div");
+    msg.className = "confirm-message";
+    msg.textContent = isProtected
+      ? "Um das Passwort zu ändern, zuerst den Wiederherstellungs-Code eingeben. Achtung: bisher gespeicherte, verschlüsselte Adressen dieser Bestellung gehen dabei verloren und müssten neu eingetragen werden."
+      : "Um ein Passwort für die Adressen dieser Sammelbestellung festzulegen, zuerst den Wiederherstellungs-Code eingeben.";
+    box.appendChild(msg);
+
+    const codeField = document.createElement("div");
+    codeField.className = "field";
+    codeField.innerHTML = `<label class="label">Wiederherstellungs-Code</label>`;
+    const codeInput = document.createElement("input");
+    codeInput.className = "text-input";
+    codeInput.type = "text";
+    codeInput.autocomplete = "off";
+    codeField.appendChild(codeInput);
+    box.appendChild(codeField);
+
+    // Passwort-Felder sind erst nach korrektem Code sichtbar.
+    const pwSection = document.createElement("div");
+    pwSection.className = "address-password-newfields";
+    pwSection.style.display = "none";
+    const pwField = document.createElement("div");
+    pwField.className = "field";
+    pwField.innerHTML = `<label class="label">Neues Passwort</label>`;
+    const pwInput = document.createElement("input");
+    pwInput.className = "text-input";
+    pwInput.type = "password";
+    pwInput.autocomplete = "off";
+    pwField.appendChild(pwInput);
+    pwSection.appendChild(pwField);
+
+    const pwConfirmField = document.createElement("div");
+    pwConfirmField.className = "field";
+    pwConfirmField.innerHTML = `<label class="label">Passwort bestätigen</label>`;
+    const pwConfirmInput = document.createElement("input");
+    pwConfirmInput.className = "text-input";
+    pwConfirmInput.type = "password";
+    pwConfirmInput.autocomplete = "off";
+    pwConfirmField.appendChild(pwConfirmInput);
+    pwSection.appendChild(pwConfirmField);
+    box.appendChild(pwSection);
+
+    const actions = document.createElement("div");
+    actions.className = "confirm-actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "btn secondary form-btn";
+    cancelBtn.textContent = "Abbrechen";
+    cancelBtn.addEventListener("click", closeDialog);
+
+    const codeSubmitBtn = document.createElement("button");
+    codeSubmitBtn.type = "button";
+    codeSubmitBtn.className = "btn primary form-btn";
+    codeSubmitBtn.textContent = "Bestätigen";
+    codeSubmitBtn.addEventListener("click", () => {
+      if (codeInput.value !== RECOVERY_CODE) {
+        addressPasswordError = "Wiederherstellungs-Code ist falsch.";
+        render();
+        return;
+      }
+      addressPasswordError = "";
+      codeField.style.display = "none";
+      codeSubmitBtn.style.display = "none";
+      pwSection.style.display = "flex";
+      saveSubmitBtn.style.display = "";
+      pwInput.focus();
+    });
+
+    const saveSubmitBtn = document.createElement("button");
+    saveSubmitBtn.type = "button";
+    saveSubmitBtn.className = "btn primary form-btn";
+    saveSubmitBtn.textContent = "Passwort speichern";
+    saveSubmitBtn.style.display = "none";
+    saveSubmitBtn.addEventListener("click", async () => {
+      const pw = pwInput.value;
+      const pwConfirm = pwConfirmInput.value;
+      if (!pw || pw.length < 4) {
+        addressPasswordError = "Das Passwort muss mindestens 4 Zeichen haben.";
+        render();
+        return;
+      }
+      if (pw !== pwConfirm) {
+        addressPasswordError = "Die Passwörter stimmen nicht überein.";
+        render();
+        return;
+      }
+      saveSubmitBtn.disabled = true;
+      saveSubmitBtn.textContent = "Speichert…";
+      const addressesToEncrypt = collectOrderAddresses(order);
+      await setOrderAddressPassword(order, pw, addressesToEncrypt);
+      unlockedAddressesByOrder[order.id] = addressesToEncrypt;
+      addressPasswordUI = null;
+      addressPasswordError = "";
+      render();
+      persist();
+    });
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(codeSubmitBtn);
+    actions.appendChild(saveSubmitBtn);
+    box.appendChild(actions);
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    codeInput.focus();
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeDialog();
+    });
+  }
+
   // ---------- Rendering ----------
 
   const root = document.getElementById("app");
+
+  // Event-Delegation für den "Passwort eingeben"-Button im Adressbereich:
+  // das Element wird bei jedem render() per innerHTML neu erzeugt, ein
+  // direkter addEventListener würde also verloren gehen. Ein einmalig auf
+  // root registrierter Handler übersteht das.
+  root.addEventListener("click", (e) => {
+    const btn = e.target.closest(".address-unlock-btn");
+    if (!btn) return;
+    const orderId = btn.dataset.orderId;
+    addressPasswordUI = { orderId, mode: "unlock" };
+    addressPasswordError = "";
+    render();
+  });
 
   function render() {
     if (state.addresses == null) state.addresses = {};
@@ -450,6 +814,9 @@
     root.appendChild(renderHeader());
     root.appendChild(renderTabsBar());
     root.appendChild(renderOrderView(order));
+    if (addressPasswordUI && addressPasswordUI.orderId === order.id) {
+      showAddressPasswordDialog(order);
+    }
     // WICHTIG: render() speichert absichtlich NICHT automatisch. Sonst würde
     // auch ein reines Polling-Update (frische Daten von einem anderen Gerät)
     // sofort wieder zurückgeschrieben. persist() wird stattdessen gezielt an
@@ -941,6 +1308,7 @@
     if (order.priceList == null) order.priceList = [];
     if (order.priceListName == null) order.priceListName = "";
     if (order.eurRate == null) order.eurRate = "0.865";
+    if (order.addressProtection === undefined) order.addressProtection = null;
 
     const frag = document.createDocumentFragment();
 
@@ -1022,7 +1390,23 @@
     if (order.products.length > 0) {
       const peopleSection = document.createElement("section");
       peopleSection.className = "section";
-      peopleSection.innerHTML = `<div class="section-head"><h2>${ICONS.users}Wer zahlt wie viel</h2></div>`;
+      const peopleHead = document.createElement("div");
+      peopleHead.className = "section-head";
+      peopleHead.innerHTML = `<h2>${ICONS.users}Wer zahlt wie viel</h2>`;
+
+      const addressProtectBtn = document.createElement("button");
+      addressProtectBtn.type = "button";
+      addressProtectBtn.className = "btn secondary small";
+      addressProtectBtn.innerHTML = order.addressProtection
+        ? `${ICONS.lock}Passwort ändern`
+        : `${ICONS.lock}Adressschutz einrichten`;
+      addressProtectBtn.addEventListener("click", () => {
+        addressPasswordUI = { orderId: order.id, mode: "set" };
+        addressPasswordError = "";
+        render();
+      });
+      peopleHead.appendChild(addressProtectBtn);
+      peopleSection.appendChild(peopleHead);
 
       if (discountNum > 0) {
         const discountNote = document.createElement("div");
@@ -1317,7 +1701,12 @@
       })
       .join("");
 
-    const address = getAddress(name);
+    const isProtected = !!order.addressProtection;
+    const unlocked = unlockedAddressesByOrder[order.id];
+    // Adressquelle: bei geschützter, entsperrter Order aus den entschlüsselten
+    // Daten dieser Sitzung; sonst (kein Schutz) wie bisher direkt aus
+    // state.addresses.
+    const address = isProtected ? (unlocked ? unlocked[name] : null) : getAddress(name);
     const addressRows = address
       ? [
           ["Name", address.fullName],
@@ -1328,24 +1717,32 @@
           ["Land", address.country],
         ].filter(([, value]) => value)
       : [];
-    const addressHtml =
-      addressRows.length > 0
-        ? `
-          <div class="person-detail-address">
-            <div class="person-detail-address-head">${ICONS.mapPin}<span>Adresse</span></div>
-            ${addressRows
-              .map(
-                ([label, value]) => `
-                  <div class="address-detail-row">
-                    <span class="address-detail-label">${esc(label)}:</span>
-                    <span class="address-detail-value">${esc(value)}</span>
-                  </div>
-                `
-              )
-              .join("")}
-          </div>
-        `
-        : "";
+
+    let addressHtml = "";
+    if (isProtected && !unlocked) {
+      addressHtml = `
+        <div class="person-detail-address person-detail-address-locked">
+          <div class="person-detail-address-head">${ICONS.lock}<span>Adresse passwortgeschützt</span></div>
+          <button type="button" class="address-unlock-btn" data-order-id="${esc(order.id)}">Passwort eingeben</button>
+        </div>
+      `;
+    } else if (addressRows.length > 0) {
+      addressHtml = `
+        <div class="person-detail-address">
+          <div class="person-detail-address-head">${ICONS.mapPin}<span>Adresse</span></div>
+          ${addressRows
+            .map(
+              ([label, value]) => `
+                <div class="address-detail-row">
+                  <span class="address-detail-label">${esc(label)}:</span>
+                  <span class="address-detail-value">${esc(value)}</span>
+                </div>
+              `
+            )
+            .join("")}
+        </div>
+      `;
+    }
 
     return `
       <div class="person-detail-items">${itemsHtml}</div>
