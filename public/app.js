@@ -454,7 +454,10 @@
 
   function startPolling() {
     setInterval(async () => {
-      if (formOpen || dirty || pushTimer) return; // während Eingabe/offenem Formular nicht überschreiben
+      // Während Eingabe/offenem Formular oder offenem Adress-Passwort-Dialog
+      // nicht überschreiben - sonst würde ein Zwischen-Update den Dialog
+      // durch ein zusätzliches, unabhängiges Overlay "verdoppeln".
+      if (formOpen || addressPasswordUI || dirty || pushTimer) return;
       const data = await fetchState();
       if (data && data.version !== serverVersion) {
         serverVersion = data.version;
@@ -582,6 +585,11 @@
     const { mode } = addressPasswordUI;
     const isProtected = !!order.addressProtection;
 
+    // Absicherung: falls aus irgendeinem Grund noch ein Overlay von einem
+    // vorherigen Aufruf offen ist (sollte durch die Polling-Pause oben nicht
+    // mehr vorkommen), erst entfernen statt ein zweites obendrauf zu legen.
+    document.querySelectorAll(".address-password-box").forEach((el) => el.closest(".confirm-overlay")?.remove());
+
     const overlay = document.createElement("div");
     overlay.className = "confirm-overlay";
 
@@ -599,6 +607,7 @@
     }
 
     const closeDialog = () => {
+      overlay.remove();
       addressPasswordUI = null;
       addressPasswordError = "";
       render();
@@ -649,18 +658,26 @@
         if (!pw) return;
         submitBtn.disabled = true;
         submitBtn.textContent = "Prüfe…";
-        const result = await tryUnlockOrderAddresses(order, pw);
-        if (result === null) {
-          addressPasswordError = "Falsches Passwort.";
+        try {
+          const result = await tryUnlockOrderAddresses(order, pw);
+          if (result === null) {
+            addressPasswordError = "Falsches Passwort.";
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Entsperren";
+            render();
+            return;
+          }
+          unlockedAddressesByOrder[order.id] = result;
+          closeDialog();
+        } catch (err) {
+          // Sollte mit modernen Browsern nie passieren, aber falls doch:
+          // Button-Zustand zurücksetzen statt für immer bei "Prüfe…" hängen
+          // zu bleiben.
+          addressPasswordError = "Etwas ist schiefgelaufen. Bitte erneut versuchen.";
           submitBtn.disabled = false;
           submitBtn.textContent = "Entsperren";
           render();
-          return;
         }
-        unlockedAddressesByOrder[order.id] = result;
-        addressPasswordUI = null;
-        addressPasswordError = "";
-        render();
       };
       submitBtn.addEventListener("click", submit);
       input.addEventListener("keydown", (e) => {
@@ -768,13 +785,20 @@
       }
       saveSubmitBtn.disabled = true;
       saveSubmitBtn.textContent = "Speichert…";
-      const addressesToEncrypt = collectOrderAddresses(order);
-      await setOrderAddressPassword(order, pw, addressesToEncrypt);
-      unlockedAddressesByOrder[order.id] = addressesToEncrypt;
-      addressPasswordUI = null;
-      addressPasswordError = "";
-      render();
-      persist();
+      try {
+        const addressesToEncrypt = collectOrderAddresses(order);
+        await setOrderAddressPassword(order, pw, addressesToEncrypt);
+        unlockedAddressesByOrder[order.id] = addressesToEncrypt;
+        closeDialog();
+        persist();
+      } catch (err) {
+        // Button-Zustand zurücksetzen statt für immer bei "Speichert…"
+        // hängen zu bleiben, falls die Verschlüsselung unerwartet fehlschlägt.
+        addressPasswordError = "Etwas ist schiefgelaufen. Bitte erneut versuchen.";
+        saveSubmitBtn.disabled = false;
+        saveSubmitBtn.textContent = "Passwort speichern";
+        render();
+      }
     });
 
     actions.appendChild(cancelBtn);
